@@ -189,10 +189,10 @@ async function runLoop(
 		let hasMoreToolCalls = true;
 
 		// Inner loop: process tool calls and steering messages
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
+		while (hasMoreToolCalls || pendingMessages.length > 0) { // 工具结果需要模型接着处理，或用户在运行中补充了要求。
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
-				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn); // 两轮之间，上层可能已经压缩了上下文或切换了模型。
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
@@ -247,7 +247,7 @@ async function runLoop(
 				};
 			}
 
-			// Stream assistant response
+			// 等这一轮模型回复收齐，再判断它是直接作答，还是要求调用工具。
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 			newMessages.push(message);
 
@@ -264,7 +264,7 @@ async function runLoop(
 				return;
 			}
 
-			// Check for tool calls
+			// 模型说“我来读 README”只是文字；带有 toolCall 的内容块才会触发读取。
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 
 			const toolResults: ToolResultMessage[] = [];
@@ -273,6 +273,7 @@ async function runLoop(
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
+				// 回复被截断时，连文件名也可能只收到一半。给每个调用返回失败，让模型有机会重试。
 				const executedToolBatch =
 					message.stopReason === "length"
 						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
@@ -281,7 +282,7 @@ async function runLoop(
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
 				for (const result of toolResults) {
-					currentContext.messages.push(result);
+					currentContext.messages.push(result); // 把读到的内容放进对话，下一轮模型才能据此回答。
 					newMessages.push(result);
 				}
 			}
@@ -292,7 +293,7 @@ async function runLoop(
 				context: currentContext,
 				newMessages,
 			};
-			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
+			const decision = await config.finishTurn?.(lastCompletedTurn, signal); // 当前回合结束，上层可以要求整次运行结束或继续。
 			await emit({ type: "turn_end", message, toolResults });
 
 			if (decision?.action === "end") {
@@ -301,13 +302,13 @@ async function runLoop(
 			}
 
 			explicitContinuation = decision?.action === "continue";
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			pendingMessages = (await config.getSteeringMessages?.()) || []; // 用户中途补充的要求，在下一轮交给模型。
 			if (hasMoreToolCalls || pendingMessages.length > 0) {
 				explicitContinuation = false;
 			}
 		}
 
-		// Agent would stop here. Check for follow-up messages.
+		// 当前任务自然停下后，再取排队的后续问题，交给内层循环处理。
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
@@ -400,7 +401,7 @@ async function streamAssistantResponse(
 		messages = await config.transformContext(messages, signal);
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
+	// 把内部消息转换成模型接受的格式，工具返回的 README 内容也由这条路径进入请求。
 	const llmMessages = await config.convertToLlm(messages);
 
 	const llmContext = normalizeContext({ messages: llmMessages });
@@ -421,6 +422,7 @@ async function streamAssistantResponse(
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
+	// 每个片段都更新同一条回复；遇到 done 或 error 后，把最终消息交回主循环。
 	for await (const event of response) {
 		switch (event.type) {
 			case "start":
@@ -526,6 +528,7 @@ async function executeToolCalls(
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
+	// 同一条回复可以要求读多个文件。全局配置或其中一个工具要求串行时，整批按顺序执行。
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
 	}
@@ -722,7 +725,7 @@ async function prepareToolCall(
 			isError: true,
 		};
 	}
-	const tool = tools.find((t) => t.name === toolCall.name);
+	const tool = tools.find((t) => t.name === toolCall.name); // 按模型给出的名字，在本次调用可用的工具里找实现。
 	if (!tool) {
 		return {
 			kind: "immediate",
@@ -733,6 +736,7 @@ async function prepareToolCall(
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		// 例如 read 要求 path 是字符串。校验抛错会进入下方 catch，生成一条失败结果。
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
@@ -933,7 +937,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
 	return {
 		role: "toolResult",
-		toolCallId: finalized.toolCall.id,
+		toolCallId: finalized.toolCall.id, // 同一轮读两个文件也能凭这个 ID 把各自的结果对回原请求。
 		toolName: finalized.toolCall.name,
 		// Untyped tools (JS extensions) can return results without content; normalize
 		// so the null never enters session history or provider payloads.
